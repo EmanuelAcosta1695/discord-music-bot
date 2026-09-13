@@ -3,12 +3,13 @@ import logging
 import random
 import shlex
 import sys
+import time
 from collections import deque
 
 import discord
 import yt_dlp
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 log = logging.getLogger("music-bot")
 
@@ -42,15 +43,30 @@ DEFAULT_HEADERS = {
 ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
 
 
-def format_duration(seconds):
-    if not seconds:
-        return "Live/Unknown"
-    seconds = int(seconds)
+def format_clock(seconds: int | float | None) -> str:
+    seconds = max(0, int(seconds or 0))
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     if h:
         return f"{h}:{m:02}:{s:02}"
     return f"{m}:{s:02}"
+
+
+def format_duration(seconds):
+    if not seconds:
+        return "Live/Unknown"
+    return format_clock(seconds)
+
+
+def format_progress(position: int, duration: int | None, width: int = 18) -> str:
+    """Return a compact, Discord-friendly scrubber bar."""
+    if not duration:
+        return f"`{format_clock(position)}`  LIVE"
+
+    ratio = min(max(position / duration, 0), 1)
+    filled = min(width, round(ratio * width))
+    bar = "▰" * filled + "▱" * (width - filled)
+    return f"`{format_clock(position)}`  {bar}  `{format_clock(duration)}`"
 
 
 class Song:
@@ -122,17 +138,152 @@ class GuildMusicState:
         self.loop_mode: str = "off"  # "off" | "song" | "queue"
         self.volume: float = 0.5
         self.text_channel: discord.abc.Messageable | None = None
+        self.started_at: float | None = None
+        self.paused_at: float | None = None
+        self.paused_seconds: float = 0
+        self.progress_message: discord.Message | None = None
+
+
+class MusicControls(discord.ui.View):
+    """Buttons attached to the current player card."""
+
+    def __init__(self, music: "Music", guild_id: int):
+        super().__init__(timeout=900)
+        self.music = music
+        self.guild_id = guild_id
+
+    async def get_state(self, interaction: discord.Interaction) -> GuildMusicState | None:
+        state = self.music.get_state(self.guild_id)
+        user_voice = getattr(interaction.user, "voice", None)
+        if (
+            state.voice_client is None
+            or state.voice_client.channel is None
+            or user_voice is None
+            or user_voice.channel != state.voice_client.channel
+        ):
+            await interaction.response.send_message(
+                "Join the bot's voice channel to use these controls.", ephemeral=True
+            )
+            return None
+        return state
+
+    @discord.ui.button(label="Pause / Resume", style=discord.ButtonStyle.primary)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self.get_state(interaction)
+        if state is None:
+            return
+        if state.voice_client.is_playing():
+            state.paused_at = time.monotonic()
+            state.voice_client.pause()
+        elif state.voice_client.is_paused():
+            if state.paused_at is not None:
+                state.paused_seconds += time.monotonic() - state.paused_at
+            state.paused_at = None
+            state.voice_client.resume()
+        else:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=self.music.now_playing_embed(state), view=self)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self.get_state(interaction)
+        if state is None:
+            return
+        if not state.voice_client.is_playing() and not state.voice_client.is_paused():
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        state.voice_client.stop()
+        await interaction.response.send_message("Skipped.", ephemeral=True)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self.get_state(interaction)
+        if state is None:
+            return
+        state.queue.clear()
+        state.current = None
+        state.started_at = None
+        state.paused_at = None
+        if state.voice_client:
+            state.voice_client.stop()
+            await state.voice_client.disconnect()
+            state.voice_client = None
+        state.progress_message = None
+        stopped = discord.Embed(
+            title="Playback stopped",
+            description="The queue was cleared and I left the voice channel.",
+            color=discord.Color.dark_grey(),
+        )
+        await interaction.response.edit_message(embed=stopped, view=None)
 
 
 class Music(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.states: dict[int, GuildMusicState] = {}
+        self.progress_updater.start()
+
+    def cog_unload(self):
+        self.progress_updater.cancel()
 
     def get_state(self, guild_id: int) -> GuildMusicState:
         if guild_id not in self.states:
             self.states[guild_id] = GuildMusicState()
         return self.states[guild_id]
+
+    @staticmethod
+    def current_position(state: GuildMusicState) -> int:
+        if state.started_at is None:
+            return 0
+        end_time = state.paused_at if state.paused_at is not None else time.monotonic()
+        return max(0, int(end_time - state.started_at - state.paused_seconds))
+
+    def now_playing_embed(self, state: GuildMusicState) -> discord.Embed:
+        song = state.current
+        assert song is not None
+
+        status = "Paused" if state.paused_at is not None else "Playing"
+        embed = discord.Embed(
+            title="🎵  NOW PLAYING",
+            description=f"### [{song.title}]({song.webpage_url})",
+            color=discord.Color.from_rgb(139, 92, 246),
+        )
+        embed.set_author(name="Discord Music Player")
+        if song.thumbnail:
+            embed.set_thumbnail(url=song.thumbnail)
+        embed.add_field(
+            name="⏱  Progress",
+            value=format_progress(self.current_position(state), song.duration),
+            inline=False,
+        )
+        if song.requester:
+            embed.add_field(name="Requested by", value=song.requester.mention, inline=True)
+        embed.add_field(name="Status", value=status, inline=True)
+        embed.set_footer(
+            text=f"Volume {int(state.volume * 100)}%  •  Loop: {state.loop_mode.title()}"
+        )
+        return embed
+
+    @tasks.loop(seconds=10)
+    async def progress_updater(self):
+        """Refresh the existing card instead of sending a message every tick."""
+        for state in self.states.values():
+            if (
+                state.current is None
+                or state.progress_message is None
+                or state.voice_client is None
+                or not (state.voice_client.is_playing() or state.voice_client.is_paused())
+            ):
+                continue
+            try:
+                await state.progress_message.edit(embed=self.now_playing_embed(state))
+            except (discord.HTTPException, discord.Forbidden):
+                state.progress_message = None
+
+    @progress_updater.before_loop
+    async def before_progress_updater(self):
+        await self.bot.wait_until_ready()
 
     # -- Playback engine ---------------------------------------------------
 
@@ -153,6 +304,7 @@ class Music(commands.Cog):
             return
 
         state.current = next_song
+        state.progress_message = None
 
         headers = {**DEFAULT_HEADERS, **next_song.http_headers}
         header_block = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
@@ -194,19 +346,15 @@ class Music(commands.Cog):
                 log.error(f"Error advancing queue: {e}")
 
         state.voice_client.play(source, after=after_playing)
+        state.started_at = time.monotonic()
+        state.paused_at = None
+        state.paused_seconds = 0
 
         if state.text_channel:
-            embed = discord.Embed(
-                title="🎶 Now Playing",
-                description=f"[{next_song.title}]({next_song.webpage_url})",
-                color=discord.Color.blurple(),
+            state.progress_message = await state.text_channel.send(
+                embed=self.now_playing_embed(state),
+                view=MusicControls(self, guild.id),
             )
-            if next_song.thumbnail:
-                embed.set_thumbnail(url=next_song.thumbnail)
-            embed.add_field(name="Duration", value=format_duration(next_song.duration))
-            if next_song.requester:
-                embed.add_field(name="Requested by", value=next_song.requester.mention)
-            await state.text_channel.send(embed=embed)
 
     # -- Auto-leave when alone ----------------------------------------------
 
@@ -333,6 +481,7 @@ class Music(commands.Cog):
     async def pause(self, interaction: discord.Interaction):
         state = self.get_state(interaction.guild.id)
         if state.voice_client and state.voice_client.is_playing():
+            state.paused_at = time.monotonic()
             state.voice_client.pause()
             await interaction.response.send_message("Paused ⏸️")
         else:
@@ -342,6 +491,9 @@ class Music(commands.Cog):
     async def resume(self, interaction: discord.Interaction):
         state = self.get_state(interaction.guild.id)
         if state.voice_client and state.voice_client.is_paused():
+            if state.paused_at is not None:
+                state.paused_seconds += time.monotonic() - state.paused_at
+            state.paused_at = None
             state.voice_client.resume()
             await interaction.response.send_message("Resumed ▶️")
         else:
@@ -386,6 +538,7 @@ class Music(commands.Cog):
         embed.add_field(name="Duration", value=format_duration(song.duration))
         if song.requester:
             embed.add_field(name="Requested by", value=song.requester.mention)
+        embed = self.now_playing_embed(state)
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="remove", description="Remove a song from the queue by its position")
