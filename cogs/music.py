@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import random
+import shlex
+import sys
 from collections import deque
 
 import discord
@@ -155,22 +157,21 @@ class Music(commands.Cog):
         headers = {**DEFAULT_HEADERS, **next_song.http_headers}
         header_block = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
 
-        # Passed as lists (not a single string) so ffmpeg gets exact arguments
-        # regardless of the OS's shell-quoting rules.
-        before_options = [
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
-            "-headers", header_block,
-        ]
-        options = ["-vn"]
+        # discord.py parses these values with shlex, so they must be strings;
+        # passing a list causes the library to ignore the options entirely.
+        before_options = (
+            "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+            f"-headers {shlex.quote(header_block)}"
+        )
 
         try:
             source = discord.PCMVolumeTransformer(
                 discord.FFmpegPCMAudio(
                     next_song.stream_url,
                     before_options=before_options,
-                    options=options,
+                    options="-vn",
+                    # Keep the real HTTP/decoder failure in the console.
+                    stderr=sys.stderr,
                 ),
                 volume=state.volume,
             )
