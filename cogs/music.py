@@ -19,7 +19,6 @@ log = logging.getLogger("music-bot")
 
 YTDL_FORMAT_OPTIONS = {
     "format": "bestaudio/best",
-    "noplaylist": True,
     "nocheckcertificate": True,
     "ignoreerrors": False,
     "quiet": True,
@@ -39,9 +38,6 @@ DEFAULT_HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 }
-
-ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
-
 
 def format_clock(seconds: int | float | None) -> str:
     seconds = max(0, int(seconds or 0))
@@ -99,31 +95,69 @@ class Song:
         self.http_headers = http_headers or {}
 
 
-async def extract_song(query: str, loop: asyncio.AbstractEventLoop) -> Song:
-    """Runs the blocking yt-dlp extraction in a thread pool executor."""
-
-    def _extract():
-        return ytdl.extract_info(query, download=False)
-
-    data = await loop.run_in_executor(None, _extract)
-
-    if data is None:
-        raise ValueError("No results found.")
-
-    if "entries" in data:
-        entries = [e for e in data["entries"] if e]
-        if not entries:
-            raise ValueError("No results found.")
-        data = entries[0]
+def song_from_info(data: dict, fallback_url: str) -> Song:
+    """Build a queue item from either a full or a flat yt-dlp result."""
+    video_id = data.get("id")
+    webpage_url = data.get("webpage_url") or data.get("original_url")
+    if not webpage_url and video_id:
+        webpage_url = f"https://www.youtube.com/watch?v={video_id}"
 
     return Song(
-        stream_url=data["url"],
+        # Flat playlist entries deliberately do not have a stream URL.  It is
+        # resolved immediately before playback so YouTube's signed URLs do not
+        # expire while a long playlist is waiting in the queue.
+        stream_url=data.get("url") if data.get("_type") != "url" else None,
         title=data.get("title", "Unknown title"),
-        webpage_url=data.get("webpage_url", query),
+        webpage_url=webpage_url or fallback_url,
         duration=data.get("duration", 0),
         thumbnail=data.get("thumbnail"),
         http_headers=data.get("http_headers") or {},
     )
+
+
+async def extract_songs(
+    query: str, loop: asyncio.AbstractEventLoop
+) -> tuple[list[Song], str | None]:
+    """Load one track or all the entries in a playlist without downloading."""
+
+    def _extract():
+        # ``in_playlist`` keeps playlist loading quick while retaining full
+        # metadata for a standalone video/search result.
+        options = {**YTDL_FORMAT_OPTIONS, "extract_flat": "in_playlist"}
+        with yt_dlp.YoutubeDL(options) as extractor:
+            return extractor.extract_info(query, download=False)
+
+    data = await loop.run_in_executor(None, _extract)
+    if data is None:
+        raise ValueError("No results found.")
+
+    if "entries" not in data:
+        return [song_from_info(data, query)], None
+
+    songs = [song_from_info(entry, query) for entry in data["entries"] if entry]
+    if not songs:
+        raise ValueError("No playable tracks were found in that playlist.")
+    return songs, data.get("title", "Playlist")
+
+
+async def resolve_stream(song: Song, loop: asyncio.AbstractEventLoop) -> None:
+    """Refresh the signed audio URL and headers immediately before playback."""
+
+    def _extract():
+        options = {**YTDL_FORMAT_OPTIONS, "noplaylist": True}
+        with yt_dlp.YoutubeDL(options) as extractor:
+            return extractor.extract_info(song.webpage_url, download=False)
+
+    data = await loop.run_in_executor(None, _extract)
+    if not data or not data.get("url"):
+        raise ValueError("yt-dlp did not return an audio stream.")
+
+    song.stream_url = data["url"]
+    song.title = data.get("title", song.title)
+    song.webpage_url = data.get("webpage_url", song.webpage_url)
+    song.duration = data.get("duration", song.duration)
+    song.thumbnail = data.get("thumbnail", song.thumbnail)
+    song.http_headers = data.get("http_headers") or {}
 
 
 # ---------------------------------------------------------------------------
@@ -306,15 +340,32 @@ class Music(commands.Cog):
         state.current = next_song
         state.progress_message = None
 
+        try:
+            await resolve_stream(next_song, self.bot.loop)
+        except Exception as e:
+            log.warning("Couldn't resolve %s: %s", next_song.webpage_url, e)
+            if state.text_channel:
+                await state.text_channel.send(
+                    f"Couldn't load **{next_song.title}**, skipping it. (`{e}`)"
+                )
+            await self.play_next(guild)
+            return
+
+        # FFmpeg has a dedicated user-agent option.  Passing it this way is
+        # more reliable than including it only in ``-headers`` on Windows,
+        # where YouTube otherwise answers the media request with HTTP 403.
         headers = {**DEFAULT_HEADERS, **next_song.http_headers}
+        user_agent = headers.pop("User-Agent", DEFAULT_HEADERS["User-Agent"])
         header_block = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
 
         # discord.py parses these values with shlex, so they must be strings;
         # passing a list causes the library to ignore the options entirely.
         before_options = (
             "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-            f"-headers {shlex.quote(header_block)}"
+            f"-user_agent {shlex.quote(user_agent)}"
         )
+        if header_block:
+            before_options += f" -headers {shlex.quote(header_block)}"
 
         try:
             source = discord.PCMVolumeTransformer(
@@ -429,24 +480,42 @@ class Music(commands.Cog):
             await state.voice_client.move_to(voice_channel)
 
         try:
-            song = await extract_song(query, self.bot.loop)
+            songs, playlist_title = await extract_songs(query, self.bot.loop)
         except Exception as e:
             await interaction.followup.send(f"Couldn't load that: `{e}`")
             return
 
-        song.requester = interaction.user
-        state.queue.append(song)
+        for song in songs:
+            song.requester = interaction.user
+        state.queue.extend(songs)
+
+        is_playlist = playlist_title is not None
+        item_label = (
+            f"**{len(songs)} tracks** from **{playlist_title}**"
+            if is_playlist
+            else f"**{songs[0].title}**"
+        )
 
         if state.voice_client.is_playing() or state.voice_client.is_paused():
             embed = discord.Embed(
                 title="Added to Queue",
-                description=f"[{song.title}]({song.webpage_url})",
+                description=(
+                    f"Added {item_label}."
+                    if is_playlist
+                    else f"[{songs[0].title}]({songs[0].webpage_url})"
+                ),
                 color=discord.Color.green(),
             )
-            embed.add_field(name="Position in queue", value=str(len(state.queue)))
+            first_position = len(state.queue) - len(songs) + 1
+            position = (
+                f"{first_position}-{len(state.queue)}"
+                if len(songs) > 1
+                else str(first_position)
+            )
+            embed.add_field(name="Position in queue", value=position)
             await interaction.followup.send(embed=embed)
         else:
-            await interaction.followup.send(f"Loading **{song.title}**...")
+            await interaction.followup.send(f"Loading {item_label}...")
             await self.play_next(interaction.guild)
 
     @app_commands.command(name="skip", description="Skip the current song (alias: next)")

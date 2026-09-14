@@ -6,3 +6,4 @@ venv/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
+roadmap.txt
